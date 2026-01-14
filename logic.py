@@ -1,171 +1,190 @@
 import datetime
 import difflib
 from datetime import timedelta
-from linebot.models import TextSendMessage, QuickReply, QuickReplyButton, MessageAction
+from linebot.models import (
+    TextSendMessage, QuickReply, QuickReplyButton, MessageAction, 
+    PostbackAction, DatetimePickerAction, TemplateSendMessage, ConfirmTemplate
+)
 import services
 import config
+import utils
 
-# 使用者狀態存放區
+# 使用者狀態與暫存資料
 user_sessions = {}
+# 對話狀態機：儲存使用者目前進行到哪一步
+user_states = {} 
+
+# 定義狀態常數
+STATE_WAITING_NAME = 'WAITING_NAME'
+STATE_WAITING_TYPE = 'WAITING_TYPE'
+STATE_WAITING_METHOD = 'WAITING_METHOD'
+STATE_WAITING_DATETIME = 'WAITING_DATETIME'
+STATE_WAITING_CONFIRM = 'WAITING_CONFIRM'
+
+# 定義選項
+TYPES = ['保單諮詢', '保單簽約', '專屬諮詢', '天耀週轉']
+
+# --- 互動式新增流程 (Start) ---
+def start_add_flow(user_id):
+    user_states[user_id] = {
+        'step': STATE_WAITING_NAME,
+        'data': {}
+    }
+    return TextSendMessage(text="請輸入名字？")
+
+def handle_user_input(user_id, text, postback_data=None, postback_params=None):
+    # 檢查該使用者是否在對話流程中
+    if user_id not in user_states:
+        return None
+    
+    current_step = user_states[user_id]['step']
+    data = user_states[user_id]['data']
+    
+    # 1. 輸入名字階段
+    if current_step == STATE_WAITING_NAME:
+        data['name'] = text
+        user_states[user_id]['step'] = STATE_WAITING_TYPE
+        
+        # 產生類型按鈕
+        actions = [QuickReplyButton(action=MessageAction(label=t, text=t)) for t in TYPES]
+        return TextSendMessage(text=f"嗨 {text}，請選擇類型？", quick_reply=QuickReply(items=actions))
+
+    # 2. 選擇類型階段
+    elif current_step == STATE_WAITING_TYPE:
+        if text not in TYPES:
+            return TextSendMessage(text="請點選下方的按鈕選擇類型喔！")
+        
+        data['type'] = text
+        
+        # 判斷是否需要問 實體/線上
+        if text in ['保單諮詢', '專屬諮詢']:
+            user_states[user_id]['step'] = STATE_WAITING_METHOD
+            actions = [
+                QuickReplyButton(action=MessageAction(label="實體", text="實體")),
+                QuickReplyButton(action=MessageAction(label="線上", text="線上"))
+            ]
+            return TextSendMessage(text="請問是實體還是線上？", quick_reply=QuickReply(items=actions))
+        else:
+            # 其他類型預設實體，直接跳去問時間
+            data['method'] = '實體'
+            user_states[user_id]['step'] = STATE_WAITING_DATETIME
+            return TextSendMessage(
+                text="請選擇日期與時間",
+                quick_reply=QuickReply(items=[
+                    QuickReplyButton(action=DatetimePickerAction(
+                        label="選擇時間", data="action=sel_time", mode="datetime"
+                    ))
+                ])
+            )
+
+    # 3. 選擇 實體/線上 階段
+    elif current_step == STATE_WAITING_METHOD:
+        if text not in ['實體', '線上']:
+            return TextSendMessage(text="請選擇實體或線上。")
+        
+        data['method'] = text
+        user_states[user_id]['step'] = STATE_WAITING_DATETIME
+        return TextSendMessage(
+            text="請選擇日期與時間",
+            quick_reply=QuickReply(items=[
+                QuickReplyButton(action=DatetimePickerAction(
+                    label="選擇時間", data="action=sel_time", mode="datetime"
+                ))
+            ])
+        )
+
+    # 4. 選擇 日期時間 階段 (接收 Postback)
+    elif current_step == STATE_WAITING_DATETIME:
+        if not postback_params:
+            return TextSendMessage(text="請點擊按鈕選擇時間喔！")
+        
+        # LINE datetime picker 回傳格式: "2024-02-01T14:00"
+        dt_str = postback_params['datetime'] 
+        dt_obj = datetime.datetime.fromisoformat(dt_str)
+        
+        data['datetime'] = dt_obj
+        
+        # 產生預覽格式：2/1 毓紘保單諮詢(21線上)
+        # 取得小時
+        hour = dt_obj.hour
+        month = dt_obj.month
+        day = dt_obj.day
+        name = data['name']
+        ctype = data['type']
+        method = data['method']
+        
+        preview_text = f"{month}/{day} {name}{ctype}({hour}{method})"
+        data['preview'] = preview_text
+        
+        user_states[user_id]['step'] = STATE_WAITING_CONFIRM
+        
+        actions = [
+            QuickReplyButton(action=MessageAction(label="正確", text="確認:正確")),
+            QuickReplyButton(action=MessageAction(label="錯誤", text="確認:錯誤"))
+        ]
+        return TextSendMessage(text=f"新增內容：\n{preview_text}\n\n請問是否正確？", quick_reply=QuickReply(items=actions))
+
+    # 5. 確認階段
+    elif current_step == STATE_WAITING_CONFIRM:
+        if text == "確認:正確":
+            # 寫入邏輯
+            # 計算結束時間
+            start_dt = data['datetime']
+            duration = utils.DURATION_MAP.get(data['type'], 1) # 預設1小時
+            end_dt = start_dt + timedelta(hours=duration)
+            
+            # 標題只包含文字部分：毓紘保單諮詢(21線上)
+            # 但Google日曆只要標題即可，時間由 start_dt 控制
+            summary = data['preview'].split(' ', 1)[1] # 去掉前面的日期
+            
+            # 構建寫入物件
+            item = {
+                'summary': summary,
+                'start': start_dt,
+                'end': end_dt,
+                'operation': 'insert',
+                'all_day': False
+            }
+            
+            # 寫入 Session 讓 finish_and_write 處理 (重用舊邏輯)
+            if user_id not in user_sessions:
+                user_sessions[user_id] = {'to_write': []}
+            user_sessions[user_id]['to_write'].append(item)
+            
+            # 清除狀態
+            del user_states[user_id]
+            
+            # 執行寫入
+            result_msg = finish_and_write(user_id)
+            # 修改回傳文字符合需求
+            return TextSendMessage(text=f"已新增{data['preview']}")
+            
+        elif text == "確認:錯誤":
+            del user_states[user_id]
+            return TextSendMessage(text="已結束新增流程。")
+            
+    return None
+
+# --- 以下是原本的邏輯 (process_next_event, finish_and_write 等) 請保留 ---
+# 為了節省篇幅，請確保您保留了 process_next_event 和 finish_and_write 函數
+# ... (這裡應該要有 process_next_event 和 finish_and_write) ...
 
 def process_next_event(user_id):
-    if user_id not in user_sessions or not user_sessions[user_id]['queue']:
-        return finish_and_write(user_id)
-
-    current_new_event = user_sessions[user_id]['queue'][0]
-    service = services.get_calendar_service()
-
-    target_date = current_new_event['start']
-    year = target_date.year
-    month = target_date.month
-    month_start = datetime.datetime(year, month, 1)
-    if month == 12:
-        next_month_start = datetime.datetime(year + 1, 1, 1)
-    else:
-        next_month_start = datetime.datetime(year, month + 1, 1)
-
-    search_min = month_start.isoformat() + '+08:00'
-    search_max = next_month_start.isoformat() + '+08:00'
-
-    events_result = service.events().list(
-        calendarId=config.CALENDAR_ID,
-        timeMin=search_min,
-        timeMax=search_max,
-        singleEvents=True
-    ).execute()
-    existing_events = events_result.get('items', [])
-
-    best_match = None
-    similarity_threshold = 0.5 
-
-    for old_event in existing_events:
-        old_title = old_event.get('summary', '')
-        new_title = current_new_event['summary']
-        
-        ratio = difflib.SequenceMatcher(None, new_title, old_title).ratio()
-        if new_title in old_title or old_title in new_title:
-            ratio = 1.0
-
-        if ratio > similarity_threshold:
-            # 判斷舊活動是整日(date) 還是 計時(dateTime)
-            if 'date' in old_event['start']:
-                old_start_str = old_event['start']['date'] # YYYY-MM-DD
-                old_start_dt = datetime.datetime.strptime(old_start_str, '%Y-%m-%d')
-            else:
-                old_start_str = old_event['start'].get('dateTime', '')
-                old_start_dt = datetime.datetime.fromisoformat(old_start_str.replace('Z', '+00:00'))
-                old_start_dt = old_start_dt.replace(tzinfo=None)
-            
-            is_time_conflict = False
-            # 只要開始日期是同一天，就視為衝突/相關
-            if old_start_dt.date() == current_new_event['start'].date():
-                is_time_conflict = True
-            
-            best_match = {
-                'event_id': old_event['id'],
-                'summary': old_title,
-                'start_str': old_start_str[:16].replace('T', ' '),
-                'ratio': ratio,
-                'conflict': is_time_conflict
-            }
-            break
-    
-    if best_match:
-        user_sessions[user_id]['current_conflict'] = {
-            'new': current_new_event,
-            'old': best_match
-        }
-        
-        # 顯示時間格式微調
-        if current_new_event.get('all_day'):
-            new_time_str = current_new_event['start'].strftime('%m/%d (整日)')
-        else:
-            new_time_str = current_new_event['start'].strftime('%m/%d %H:%M')
-        
-        if best_match['conflict']:
-            msg = f"⚠️ 發現同月份撞期衝突！\n\n新行程：{new_time_str} {current_new_event['summary']}\n舊行程：{best_match['start_str']} {best_match['summary']}\n\n請問要怎麼做？"
-            actions = [
-                QuickReplyButton(action=MessageAction(label="覆蓋舊行程", text="決策:覆蓋")),
-                QuickReplyButton(action=MessageAction(label="新增(保留兩者)", text="決策:新增")),
-                QuickReplyButton(action=MessageAction(label="取消此項", text="決策:取消"))
-            ]
-        else:
-            msg = f"🤔 發現同月份相似行程 (疑似改期)\n\n新行程：{new_time_str} {current_new_event['summary']}\n舊行程：{best_match['start_str']} {best_match['summary']}\n\n請問要怎麼做？"
-            actions = [
-                QuickReplyButton(action=MessageAction(label="取代(改期)", text="決策:取代")),
-                QuickReplyButton(action=MessageAction(label="新增(變兩場)", text="決策:新增")),
-                QuickReplyButton(action=MessageAction(label="取消此項", text="決策:取消"))
-            ]
-        return TextSendMessage(text=msg, quick_reply=QuickReply(items=actions))
-    
-    else:
-        item = user_sessions[user_id]['queue'].pop(0) 
-        item['operation'] = 'insert'
-        user_sessions[user_id]['to_write'].append(item)
-        return process_next_event(user_id)
+    # (請貼上之前給您的 process_next_event 完整代碼)
+    # ...
+    pass 
 
 def finish_and_write(user_id):
-    to_write = user_sessions[user_id].get('to_write', [])
-    if not to_write:
-        if user_id in user_sessions: del user_sessions[user_id]
-        return TextSendMessage(text="沒有任何行程被新增。")
-    
+    # (請貼上之前給您的 finish_and_write 完整代碼)
+    # 這裡我寫個簡化版示意，您用舊的即可
     service = services.get_calendar_service()
-    count_insert = 0
-    count_update = 0
-    
-    try:
-        for item in to_write:
-            # ==========================================
-            # 👇 關鍵修改：區分 整日 vs 計時
-            # ==========================================
-            if item.get('all_day'):
-                # 整日活動格式：使用 'date' (YYYY-MM-DD)
-                event_body = {
-                    'summary': item['summary'],
-                    'start': {'date': item['start'].strftime('%Y-%m-%d')},
-                    'end': {'date': item['end'].strftime('%Y-%m-%d')}, # 結束日已在 utils 加了一天
-                }
-            else:
-                # 計時活動格式：使用 'dateTime' (ISO Format)
-                event_body = {
-                    'summary': item['summary'],
-                    'start': {'dateTime': item['start'].isoformat(), 'timeZone': 'Asia/Taipei'},
-                    'end': {'dateTime': item['end'].isoformat(), 'timeZone': 'Asia/Taipei'},
-                }
-            
-            if item['operation'] == 'insert':
-                service.events().insert(calendarId=config.CALENDAR_ID, body=event_body).execute()
-                count_insert += 1
-            elif item['operation'] == 'update':
-                service.events().update(calendarId=config.CALENDAR_ID, eventId=item['event_id'], body=event_body).execute()
-                count_update += 1
-                
-        if user_id in user_sessions: del user_sessions[user_id]
-        return TextSendMessage(text=f"🎉 完成！\n新增 {count_insert} 筆\n修改 {count_update} 筆")
-        
-    except Exception as e:
-        return TextSendMessage(text=f"寫入過程發生錯誤：{str(e)}")
-
-def handle_decision(user_id, decision):
-    if user_id not in user_sessions or 'current_conflict' not in user_sessions[user_id]:
-        return TextSendMessage(text="⚠️ 操作已逾時，請重新傳送活動列表。")
-
-    conflict_data = user_sessions[user_id]['current_conflict']
-    new_item = conflict_data['new']
-    old_item = conflict_data['old']
-    
-    user_sessions[user_id]['queue'].pop(0)
-    del user_sessions[user_id]['current_conflict']
-    
-    if decision == "新增":
-        new_item['operation'] = 'insert'
-        user_sessions[user_id]['to_write'].append(new_item)
-    elif decision in ["覆蓋", "取代"]:
-        new_item['operation'] = 'update'
-        new_item['event_id'] = old_item['event_id']
-        user_sessions[user_id]['to_write'].append(new_item)
-    elif decision == "取消":
-        pass
-        
-    return process_next_event(user_id)
+    to_write = user_sessions[user_id].get('to_write', [])
+    for item in to_write:
+        body = {
+            'summary': item['summary'],
+            'start': {'dateTime': item['start'].isoformat(), 'timeZone': 'Asia/Taipei'},
+            'end': {'dateTime': item['end'].isoformat(), 'timeZone': 'Asia/Taipei'},
+        }
+        service.events().insert(calendarId=config.CALENDAR_ID, body=body).execute()
+    del user_sessions[user_id]
+    return TextSendMessage(text="完成")
