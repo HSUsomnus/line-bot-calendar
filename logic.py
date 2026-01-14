@@ -1,4 +1,3 @@
-# logic.py
 import datetime
 import difflib
 from datetime import timedelta
@@ -16,7 +15,6 @@ def process_next_event(user_id):
     current_new_event = user_sessions[user_id]['queue'][0]
     service = services.get_calendar_service()
 
-    # 鎖定月份邏輯
     target_date = current_new_event['start']
     year = target_date.year
     month = target_date.month
@@ -49,11 +47,17 @@ def process_next_event(user_id):
             ratio = 1.0
 
         if ratio > similarity_threshold:
-            old_start_str = old_event['start'].get('dateTime', old_event['start'].get('date'))
-            old_start_dt = datetime.datetime.fromisoformat(old_start_str.replace('Z', '+00:00'))
-            old_start_dt = old_start_dt.replace(tzinfo=None)
+            # 判斷舊活動是整日(date) 還是 計時(dateTime)
+            if 'date' in old_event['start']:
+                old_start_str = old_event['start']['date'] # YYYY-MM-DD
+                old_start_dt = datetime.datetime.strptime(old_start_str, '%Y-%m-%d')
+            else:
+                old_start_str = old_event['start'].get('dateTime', '')
+                old_start_dt = datetime.datetime.fromisoformat(old_start_str.replace('Z', '+00:00'))
+                old_start_dt = old_start_dt.replace(tzinfo=None)
             
             is_time_conflict = False
+            # 只要開始日期是同一天，就視為衝突/相關
             if old_start_dt.date() == current_new_event['start'].date():
                 is_time_conflict = True
             
@@ -72,7 +76,11 @@ def process_next_event(user_id):
             'old': best_match
         }
         
-        new_time_str = current_new_event['start'].strftime('%m/%d %H:%M')
+        # 顯示時間格式微調
+        if current_new_event.get('all_day'):
+            new_time_str = current_new_event['start'].strftime('%m/%d (整日)')
+        else:
+            new_time_str = current_new_event['start'].strftime('%m/%d %H:%M')
         
         if best_match['conflict']:
             msg = f"⚠️ 發現同月份撞期衝突！\n\n新行程：{new_time_str} {current_new_event['summary']}\n舊行程：{best_match['start_str']} {best_match['summary']}\n\n請問要怎麼做？"
@@ -108,11 +116,23 @@ def finish_and_write(user_id):
     
     try:
         for item in to_write:
-            event_body = {
-                'summary': item['summary'],
-                'start': {'dateTime': item['start'].isoformat(), 'timeZone': 'Asia/Taipei'},
-                'end': {'dateTime': item['end'].isoformat(), 'timeZone': 'Asia/Taipei'},
-            }
+            # ==========================================
+            # 👇 關鍵修改：區分 整日 vs 計時
+            # ==========================================
+            if item.get('all_day'):
+                # 整日活動格式：使用 'date' (YYYY-MM-DD)
+                event_body = {
+                    'summary': item['summary'],
+                    'start': {'date': item['start'].strftime('%Y-%m-%d')},
+                    'end': {'date': item['end'].strftime('%Y-%m-%d')}, # 結束日已在 utils 加了一天
+                }
+            else:
+                # 計時活動格式：使用 'dateTime' (ISO Format)
+                event_body = {
+                    'summary': item['summary'],
+                    'start': {'dateTime': item['start'].isoformat(), 'timeZone': 'Asia/Taipei'},
+                    'end': {'dateTime': item['end'].isoformat(), 'timeZone': 'Asia/Taipei'},
+                }
             
             if item['operation'] == 'insert':
                 service.events().insert(calendarId=config.CALENDAR_ID, body=event_body).execute()
