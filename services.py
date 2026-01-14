@@ -9,13 +9,26 @@ def get_calendar_service():
     service = build('calendar', 'v3', credentials=creds)
     return service
 
+# --- 保留原本的 query_month_events ---
+def query_month_events(month_str):
+    # ... (請保留原本的程式碼，不要刪除) ...
+    # 為了節省篇幅，這裡省略，請確保原本的還在
+    pass
+
+# --- 保留原本的 query_consultation_events ---
 def query_consultation_events(month_str):
+    # ... (請保留原本的程式碼，不要刪除) ...
+    pass
+
+# ==========================================
+# 👇 新增：查詢學員上課
+# ==========================================
+def query_student_class_events(month_str):
     try:
         target_month = int(month_str)
         now = datetime.datetime.now()
         year = now.year
         
-        # 設定查詢範圍
         start_date = datetime.datetime(year, target_month, 1)
         if target_month == 12:
             end_date = datetime.datetime(year + 1, 1, 1)
@@ -33,7 +46,7 @@ def query_consultation_events(month_str):
         
         roc_year = year - 1911
         # 關鍵字過濾
-        keywords = ['諮詢', '簽約', '週轉']
+        keywords = ['金流正式課', '財富藍圖']
         filtered_events = []
         
         for event in events:
@@ -42,9 +55,9 @@ def query_consultation_events(month_str):
                 filtered_events.append(event)
 
         if not filtered_events:
-            return f"📣{roc_year}-{target_month}月諮詢簽約💵\n\n目前沒有安排喔！", False
+            return f"📣{roc_year}-{target_month}月學員上課💡\n\n目前沒有安排喔！", False
             
-        reply = f"📣{roc_year}-{target_month}月諮詢簽約💵\n\n"
+        reply = f"📣{roc_year}-{target_month}月學員上課💡\n\n"
         for event in filtered_events:
             summary = event.get('summary', '無標題')
             if 'date' in event['start']:
@@ -62,6 +75,3 @@ def query_consultation_events(month_str):
         
     except Exception as e:
         return f"查詢失敗：{str(e)}", False
-        
-# (保留原本的 query_month_events 函數，這裡不重複貼上)
-# 您原本的 query_month_events 請保留在下面
