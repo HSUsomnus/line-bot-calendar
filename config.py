@@ -11,5 +11,10 @@ CALENDAR_ID = os.environ.get('CALENDAR_ID')
 
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
-# 這裡路徑維持不變，因為我們已經用 Render 的 Secret Files 處理過了
-SERVICE_ACCOUNT_FILE = '/etc/secrets/service_account.json'
+# config.py
+import os
+
+# ... (上面的 Token 設定保留不動) ...
+
+# 修改這行：讓它直接讀取當前目錄下的 json 檔案
+SERVICE_ACCOUNT_FILE = 'service_account.json'
